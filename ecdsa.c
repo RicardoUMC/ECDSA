@@ -1,11 +1,19 @@
 #include "../ecop/EC.h"
 #include <stdio.h>
+#include <string.h>
 #include <openssl/rand.h>
+#include <openssl/bio.h>
+#include <openssl/buffer.h>
+#include <openssl/sha.h>
 
 void configure_public_params(mpz_t p, mpz_t a, mpz_t b, mpz_t q, ec_point *G);
-void generate_key_pair(mpz_t p, mpz_t a, mpz_t b, mpz_t q, ec_point *G, char *filename);
+void generate_key_pair(mpz_t p, mpz_t a, mpz_t b, mpz_t q, ec_point *G, char *priv_filename, char *pub_filename);
 void ecdsa_signature(mpz_t d, mpz_t m, mpz_t p, mpz_t a, mpz_t b, mpz_t q, ec_point *G, char *filename);
 bool ecdsa_verification(mpz_t m, char *pubkey_file, char *signature_file);
+void sha256_of_file(const char *filename, mpz_t m);
+
+char *base64_encode(const char *input);
+char *base64_decode(const char *input);
 
 int main(void) {
     mpz_t p, a, b, q, d, m;
@@ -18,7 +26,7 @@ int main(void) {
     while (1) {
         printf("\nMenu:\n");
         printf("1. Generate Keys\n");
-        printf("2. Sign Message\n");
+        printf("2. Sign File\n");
         printf("3. Verify Signature\n");
         printf("4. Exit\n");
         printf("Select an option: ");
@@ -27,7 +35,7 @@ int main(void) {
         switch (option) {
             case 1:
                 configure_public_params(p, a, b, q, &G);
-                generate_key_pair(p, a, b, q, &G, "ecdsa_keypair.txt");
+                generate_key_pair(p, a, b, q, &G, "ecdsa_private_key.pem", "ecdsa_public_key.pem");
                 keys_generated = true;
                 break;
             case 2:
@@ -38,15 +46,13 @@ int main(void) {
                 printf("Enter the private key d: ");
                 mpz_inp_str(d, stdin, 10);
 
-                printf("Enter a message m: ");
-                mpz_inp_str(m, stdin, 10);
+                char file_to_sign[256];
+                printf("Enter the file path to sign: ");
+                scanf("%s", file_to_sign);
 
-                if (mpz_cmp_ui(m, 0) <= 0 || mpz_cmp(m, q) >= 0) {
-                    fprintf(stderr, "Error: m must be in the range 0 < m < q\n");
-                    break;
-                }
+                sha256_of_file(file_to_sign, m);
 
-                ecdsa_signature(d, m, p, a, b, q, &G, "ecdsa_rs.txt");
+                ecdsa_signature(d, m, p, a, b, q, &G, "ecdsa_signature.txt");
                 signature_generated = true;
                 break;
             case 3:
@@ -55,15 +61,13 @@ int main(void) {
                     break;
                 }
 
-                printf("Enter the message m to verify: ");
-                mpz_inp_str(m, stdin, 10);
+                char file_to_verify[256];
+                printf("Enter the file path to verify: ");
+                scanf("%s", file_to_verify);
 
-                if (mpz_cmp_ui(m, 0) <= 0 || mpz_cmp(m, q) >= 0) {
-                    fprintf(stderr, "Error: m must be in the range 0 < m < q\n");
-                    break;
-                }
+                sha256_of_file(file_to_verify, m);
 
-                ecdsa_verification(m, "ecdsa_keypair.txt", "ecdsa_rs.txt") ?
+                ecdsa_verification(m, "ecdsa_public_key.pem", "ecdsa_signature.txt") ?
                     printf("The signature is valid.\n") :
                     printf("The signature is not valid.\n");
 
@@ -100,13 +104,13 @@ void configure_public_params(mpz_t p, mpz_t a, mpz_t b, mpz_t q, ec_point *G) {
     G->z = 1;
 }
 
-void generate_key_pair(mpz_t p, mpz_t a, mpz_t b, mpz_t q, ec_point *G, char *filename) {
+void generate_key_pair(mpz_t p, mpz_t a, mpz_t b, mpz_t q, ec_point *G, char *priv_filename, char *pub_filename) {
     mpz_t d;
     ec_point B;
 
     mpz_inits(d, B.x, B.y, NULL);
 
-    unsigned char buffer[32];
+    uint8_t buffer[32];
     if (RAND_bytes(buffer, sizeof(buffer)) != 1) {
         perror("Error generating secure random bytes");
         mpz_clears(d, B.x, B.y, NULL);
@@ -118,24 +122,29 @@ void generate_key_pair(mpz_t p, mpz_t a, mpz_t b, mpz_t q, ec_point *G, char *fi
 
     B = point_multiplication(a, b, p, G, d);
 
-    FILE *file = fopen(filename, "w");
-    if (file == NULL) {
-        perror("Error opening file");
+    FILE *priv_file = fopen(priv_filename, "w");
+    if (priv_file == NULL) {
+        perror("Error opening private key file");
         mpz_clears(d, B.x, B.y, NULL);
         return;
     }
+    char *encoded_d = base64_encode(mpz_get_str(NULL, 10, d));
+    fprintf(priv_file, "-----BEGIN ECDSA PRIVATE KEY-----\n%s\n-----END ECDSA PRIVATE KEY-----\n", encoded_d);
+    fclose(priv_file);
+    free(encoded_d);
 
-    if (gmp_fprintf(file, "Public key: (") < 0 ||
-            gmp_fprintf(file, "%Zd, ", p) < 0 ||
-            gmp_fprintf(file, "%Zd, ", a) < 0 ||
-            gmp_fprintf(file, "%Zd, ", b) < 0 ||
-            gmp_fprintf(file, "%Zd, ", q) < 0 ||
-            gmp_fprintf(file, "(%Zd:%Zd:%d), ", G->x, G->y, G->z) < 0 ||
-            gmp_fprintf(file, "(%Zd:%Zd:%d))\n", B.x, B.y, B.z) < 0) {
-        perror("Error writing to file");
+    FILE *pub_file = fopen(pub_filename, "w");
+    if (pub_file == NULL) {
+        perror("Error opening public key file");
+        mpz_clears(d, B.x, B.y, NULL);
+        return;
     }
-
-    fclose(file);
+    char *encoded_Bx = base64_encode(mpz_get_str(NULL, 10, B.x));
+    char *encoded_By = base64_encode(mpz_get_str(NULL, 10, B.y));
+    fprintf(pub_file, "-----BEGIN ECDSA PUBLIC KEY-----\n%s\n%s\n-----END ECDSA PUBLIC KEY-----\n", encoded_Bx, encoded_By);
+    fclose(pub_file);
+    free(encoded_Bx);
+    free(encoded_By);
 
     gmp_printf("Private key d: %Zd\n", d);
     gmp_printf("Public key B: (%Zd:%Zd:%d)\n", B.x, B.y, B.z);
@@ -143,121 +152,26 @@ void generate_key_pair(mpz_t p, mpz_t a, mpz_t b, mpz_t q, ec_point *G, char *fi
     mpz_clears(d, B.x, B.y, NULL);
 }
 
-void ecdsa_signature(mpz_t d, mpz_t m, mpz_t p, mpz_t a, mpz_t b, mpz_t q, ec_point *G, char *filename) {
-    mpz_t r, s, k, k_inv, temp;
-    ec_point R;
-
-    mpz_inits(r, s, k, k_inv, R.x, R.y, temp, NULL);
-
-    do {
-        unsigned char buffer[32];
-        if (RAND_bytes(buffer, sizeof(buffer)) != 1) {
-            perror("Error generating secure random bytes");
-            mpz_clears(r, s, k, k_inv, R.x, R.y, temp, NULL);
-            return;
-        }
-
-        mpz_import(k, sizeof(buffer), 1, sizeof(buffer[0]), 0, 0, buffer);
-        mpz_mod(k, k, q);
-    } while (mpz_cmp_ui(k, 1) < 0);
-
-    R = point_multiplication(a, b, p, G, k);
-
-    mpz_set(r, R.x);
-
-    if (mpz_invert(k_inv, k, q) == 0) {
-        perror("K has no modular inverse");
-        mpz_clears(r, s, k, k_inv, R.x, R.y, temp, NULL);
-        return;
-    }
-
-    mpz_mul(temp, d, r);
-    mpz_add(temp, temp, m);
-    mpz_mod(temp, temp, q);
-
-    mpz_mul(s, temp, k_inv);
-    mpz_mod(s, s, q);
-
-    FILE *file = fopen(filename, "w");
+void sha256_of_file(const char *filename, mpz_t m) {
+    FILE *file = fopen(filename, "rb");
     if (file == NULL) {
         perror("Error opening file");
-        mpz_clears(r, s, k, k_inv, R.x, R.y, temp, NULL);
         return;
     }
 
-    if (gmp_fprintf(file, "(%Zd, ", r) < 0 ||
-            gmp_fprintf(file, "%Zd)\n", s) < 0) {
-        perror("Error writing to file");
+    SHA256_CTX sha256;
+    SHA256_Init(&sha256);
+    unsigned char buffer[1024];
+    size_t bytesRead;
+
+    while ((bytesRead = fread(buffer, 1, sizeof(buffer), file))) {
+        SHA256_Update(&sha256, buffer, bytesRead);
     }
 
     fclose(file);
 
-    gmp_printf("Signature: (r, s) = (%Zd, %Zd)\n", r, s);
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_Final(hash, &sha256);
 
-    mpz_clears(r, s, k, k_inv, R.x, R.y, temp, NULL);
-}
-
-bool ecdsa_verification(mpz_t m, char *pubkey_file, char *signature_file) {
-    mpz_t w, aux_1, aux_2, p, a, b, q, r, s;
-    ec_point G, B, P, P_temp_1, P_temp_2;
-
-    mpz_inits(w, aux_1, aux_2, p, a, b, q, r, s, G.x, G.y, B.x, B.y, P.x, P.y, P_temp_1.x, P_temp_1.y, P_temp_2.x, P_temp_2.y, NULL);
-
-    FILE *file = fopen(pubkey_file, "r");
-    if (file == NULL) {
-        perror("Error opening public key file");
-        mpz_clears(w, aux_1, aux_2, p, a, b, q, r, s, G.x, G.y, B.x, B.y, P.x, P.y, P_temp_1.x, P_temp_1.y, P_temp_2.x, P_temp_2.y, NULL);
-        return false;
-    }
-
-    if (gmp_fscanf(file, "Public key: (%Zd, %Zd, %Zd, %Zd, (%Zd:%Zd:1), (%Zd:%Zd:1))\n", p, a, b, q, G.x, G.y, B.x, B.y) != 8) {
-        perror("Error reading from public key file");
-        fclose(file);
-        mpz_clears(w, aux_1, aux_2, p, a, b, q, r, s, G.x, G.y, B.x, B.y, P.x, P.y, P_temp_1.x, P_temp_1.y, P_temp_2.x, P_temp_2.y, NULL);
-        return false;
-    }
-
-    fclose(file);
-
-    G.z = 1;
-    B.z = 1;
-
-    file = fopen(signature_file, "r");
-    if (file == NULL) {
-        perror("Error opening signature file");
-        mpz_clears(w, aux_1, aux_2, p, a, b, q, r, s, G.x, G.y, B.x, B.y, P.x, P.y, P_temp_1.x, P_temp_1.y, P_temp_2.x, P_temp_2.y, NULL);
-        return false;
-    }
-
-    if (gmp_fscanf(file, "(%Zd, %Zd)\n", r, s) != 2) {
-        perror("Error reading from signature file");
-        fclose(file);
-        mpz_clears(w, aux_1, aux_2, p, a, b, q, r, s, G.x, G.y, B.x, B.y, P.x, P.y, P_temp_1.x, P_temp_1.y, P_temp_2.x, P_temp_2.y, NULL);
-        return false;
-    }
-
-    fclose(file);
-
-    if (mpz_invert(w, s, q) == 0) {
-        perror("S has no modular inverse");
-        mpz_clears(w, aux_1, aux_2, p, a, b, q, r, s, G.x, G.y, B.x, B.y, P.x, P.y, P_temp_1.x, P_temp_1.y, P_temp_2.x, P_temp_2.y, NULL);
-        return false;
-    }
-
-    mpz_mul(aux_1, w, m);
-    mpz_mod(aux_1, aux_1, q);
-
-    mpz_mul(aux_2, w, r);
-    mpz_mod(aux_2, aux_2, q);
-
-
-    P_temp_1 = point_multiplication(a, b, p, &G, aux_1);
-    P_temp_2 = point_multiplication(a, b, p, &B, aux_2);
-    P = point_addition(a, b, p, &P_temp_1, &P_temp_2);
-
-    bool is_valid = (mpz_cmp(P.x, r) == 0);
-
-    mpz_clears(w, aux_1, aux_2, p, a, b, q, r, s, G.x, G.y, B.x, B.y, P.x, P.y, P_temp_1.x, P_temp_1.y, P_temp_2.x, P_temp_2.y, NULL);
-
-    return is_valid;
+    mpz_import(m, SHA256_DIGEST_LENGTH, 1, 1, 0, 0, hash);
 }
